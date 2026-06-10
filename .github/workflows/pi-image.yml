@@ -1,0 +1,79 @@
+name: Build Raspberry Pi image
+
+# Builds a flashable Raspberry Pi SD-card image (Pi OS Lite + CUPS + the GoPrint
+# agent, service enabled) and publishes it to THIS repo's release.
+#
+# Why it lives here and not in the goprint source repo: a workflow can only
+# publish releases in its own repo with the built-in GITHUB_TOKEN. Hosting the
+# build here means no cross-repo Personal Access Token is needed — the build
+# pulls the (public) agent tarball from this repo's release and uploads the
+# finished image back to the same release.
+#
+# Manual trigger only (a build downloads ~1 GB + emulates an ARM rootfs). Run it
+# after the release's goprint-pi-armv6 tarball exists:
+#   gh workflow run pi-image.yml -R orlando-umbrella/goprint-releases -f version=1.0.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to build, no leading v (e.g. 1.0.0). Its goprint-pi-armv6 tarball must already be attached to the v<version> release here."
+        required: true
+        type: string
+      brand:
+        description: "Brand label to ship in the image."
+        required: false
+        default: goprint
+        type: string
+
+permissions:
+  contents: write   # upload the image asset to this repo's release
+
+jobs:
+  build:
+    name: Build & publish Pi image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the image
+        id: build
+        uses: pguyot/arm-runner-action@v2
+        with:
+          # 32-bit Pi OS Lite = one universal image that boots on every Pi
+          # (Zero through 5). arm1176 emulates the armv6 baseline.
+          base_image: raspios_lite:latest
+          cpu: arm1176
+          image_additional_mb: 1024
+          optimize_image: true
+          # arm-runner-action copies this checkout to /goprint-releases.
+          commands: |
+            export GOPRINT_VERSION="${{ inputs.version }}"
+            export GOPRINT_BRAND="${{ inputs.brand }}"
+            bash /goprint-releases/pi-image/provision.sh
+
+      - name: Compress the image
+        id: compress
+        run: |
+          ver="${{ inputs.version }}"
+          out="goprint-pi-${ver}.img.xz"
+          echo "Compressing ${{ steps.build.outputs.image }} -> $out"
+          xz -T0 -9 -c "${{ steps.build.outputs.image }}" > "$out"
+          ls -lh "$out"
+          echo "asset=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload image as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: goprint-pi-${{ inputs.version }}-img
+          path: ${{ steps.compress.outputs.asset }}
+          if-no-files-found: error
+
+      - name: Publish to the v${{ inputs.version }} release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "v${{ inputs.version }}" \
+            "${{ steps.compress.outputs.asset }}" --clobber
+          echo "Published ${{ steps.compress.outputs.asset }} to v${{ inputs.version }}"
