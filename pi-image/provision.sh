@@ -56,6 +56,14 @@ if curl -fsSL "$deploy_url" -o "$tmp/deploy.tar.gz"; then
   for unit in goprint-update.service goprint-update.path goprint-update-check.service goprint-update.timer; do
     install -o root -g root -m 0644 "$tmp/deploy/$unit" "/etc/systemd/system/$unit"
   done
+  # Wi-Fi config helper (goprint#26): set Wi-Fi from the app. Tolerate older
+  # bundles that predate it.
+  if [ -f "$tmp/deploy/goprint-wifi" ]; then
+    install -o root -g root -m 0755 "$tmp/deploy/goprint-wifi" /usr/local/libexec/goprint-wifi
+    for unit in goprint-wifi.path goprint-wifi-apply.service; do
+      install -o root -g root -m 0644 "$tmp/deploy/$unit" "/etc/systemd/system/$unit"
+    done
+  fi
   # Root-owned feed config (the updater trusts ONLY this, never the agent).
   cat > /etc/default/goprint-update <<EOF
 # Root-owned self-update config (consumed by /usr/local/libexec/goprint-update).
@@ -69,6 +77,7 @@ EOF
   install -d /etc/systemd/system/multi-user.target.wants /etc/systemd/system/timers.target.wants
   ln -sf /etc/systemd/system/goprint-update.path /etc/systemd/system/multi-user.target.wants/goprint-update.path
   ln -sf /etc/systemd/system/goprint-update.timer /etc/systemd/system/timers.target.wants/goprint-update.timer
+  [ -f /etc/systemd/system/goprint-wifi.path ] && ln -sf /etc/systemd/system/goprint-wifi.path /etc/systemd/system/multi-user.target.wants/goprint-wifi.path
 else
   echo "==> No deploy bundle on v${VERSION} (pre-self-update release); image will not self-update"
 fi
