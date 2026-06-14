@@ -25,11 +25,22 @@ BRAND="${GOPRINT_BRAND:-goprint}"
 echo "==> Provisioning GoPrint image (brand=$BRAND, agent v$VERSION)"
 export DEBIAN_FRONTEND=noninteractive
 
-# 1. Print backend + mDNS. Debian packaging enables cups/avahi on first boot via
-#    deb-systemd-helper (works without a running systemd), so no manual enable.
+# 1. Print backend + mDNS + label-printer drivers. Debian packaging enables
+#    cups/avahi on first boot via deb-systemd-helper (works without a running
+#    systemd), so no manual enable.
+#
+#    Label-printer drivers are bundled at build time so a plugged-in printer is
+#    auto-detected OFFLINE — no apt at first boot (goprint#34 T1.4). The set
+#    (~13 MB) covers the three families we ship for:
+#      - printer-driver-dymo    DYMO LabelWriter (4XL, 400/450 Turbo, …)
+#      - printer-driver-ptouch  Brother P-touch / QL label printers
+#      - printer-driver-brlaser Brother laser (bonus coverage)
+#      - foomatic-db            broad PPD database (many brands)
+#    Zebra ZPL/EPL/CPCL PPDs come from the cups `sample.drv` (in `cups` itself).
 apt-get update
 apt-get install -y --no-install-recommends \
-  cups cups-filters avahi-daemon ca-certificates curl jq
+  cups cups-filters avahi-daemon ca-certificates curl jq \
+  printer-driver-dymo printer-driver-ptouch printer-driver-brlaser foomatic-db
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
