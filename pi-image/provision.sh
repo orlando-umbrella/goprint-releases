@@ -101,6 +101,9 @@ StateDirectory=goprint-agent
 StateDirectoryMode=0700
 Environment=HOME=/var/lib/goprint-agent
 Environment=XDG_CONFIG_HOME=/var/lib/goprint-agent
+# Appliance default: open LAN management so the desktop app discovers + manages
+# this Pi over the network (mDNS announce + LAN-bound API). goprint#18/#24.
+Environment=GOPRINT_LAN_MANAGEMENT=1
 ExecStart=/usr/local/bin/goprint-agent
 Restart=always
 RestartSec=3
