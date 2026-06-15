@@ -104,6 +104,43 @@ for grp in lpadmin lp; do
 done
 install -d -o goprint -g goprint -m 0700 /var/lib/goprint-agent
 
+# 3b. SSH access + a default login user, so a freshly-flashed Pi is reachable
+#     for setup/recovery/debug WITHOUT a monitor or Raspberry Pi Imager's OS
+#     customisation (which custom .img files like ours don't get). This is the
+#     separate, OS-level counterpart to the agent's in-app Wi-Fi feature — that
+#     one is the agent writing a request a root helper applies; it is NOT SSH.
+#
+#     ⚠ SECURITY: this is a KNOWN default credential on a PUBLIC image. It is a
+#     deliberate convenience for first setup + a controlled fleet. CHANGE IT
+#     (`passwd`) or switch to SSH keys before any untrusted deployment. Override
+#     at build time with GOPRINT_SSH_USER / GOPRINT_SSH_PASS. SSH host keys are
+#     NOT baked — they regenerate per-device on first boot, so devices never
+#     share an SSH identity.
+SSH_USER="${GOPRINT_SSH_USER:-pi}"
+SSH_PASS="${GOPRINT_SSH_PASS:-raspberry}"
+if ! id "$SSH_USER" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash -c "GoPrint admin" "$SSH_USER"
+fi
+echo "${SSH_USER}:${SSH_PASS}" | chpasswd
+for grp in sudo adm lpadmin lp plugdev netdev; do
+  getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$SSH_USER" || true
+done
+# Enable SSH for first boot. No running systemd in this chroot -> enable by the
+# same by-hand symlink `systemctl enable` writes, plus the canonical /boot flag
+# (Bullseye /boot and Bookworm /boot/firmware).
+systemctl enable ssh >/dev/null 2>&1 \
+  || ln -sf /lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service
+touch /boot/ssh /boot/firmware/ssh 2>/dev/null || true
+# Force fresh per-device host keys on first boot (never ship shared keys).
+rm -f /etc/ssh/ssh_host_* 2>/dev/null || true
+# First-login nudge: hand off to the operator to set their own password.
+cat > /etc/motd <<MOTD
+
+  GoPrint appliance.  Manage printers from the GoPrint app / web UI.
+  ⚠ You are on the DEFAULT password. Run  passwd  to set your own.
+
+MOTD
+
 # 4. systemd unit.
 cat > /etc/systemd/system/goprint-agent.service <<'UNIT'
 [Unit]
