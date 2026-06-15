@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+#
+# goprint-firstboot-hostname — give each freshly-flashed Pi a UNIQUE, stable
+# hostname on its first real boot, so multiple GoPrint appliances on one LAN
+# stop colliding on the stock `raspberrypi` / `raspberrypi.local` (goprint#24).
+#
+# Why first boot and not image-build time: the Pi serial is per-device, so a
+# unique name can only be derived once the card is in a specific Pi. provision.sh
+# installs this helper + its oneshot unit into the image; the unit fires once on
+# the device's first boot, this script runs, then DISABLES itself so it never
+# runs again.
+#
+# What it does (all idempotent, all best-effort — it must NEVER leave the Pi
+# unbootable, so every privileged step tolerates failure and the unit is
+# Type=oneshot with RemainAfterExit so a non-zero exit can't wedge the boot):
+#   1. reads the Pi serial from /proc/cpuinfo and derives a short hex suffix
+#   2. sets the hostname to `goprint-<suffix>` (e.g. goprint-ab12cd)
+#   3. rewrites /etc/hostname and the 127.0.1.1 line in /etc/hosts to match
+#   4. nudges avahi so mDNS advertises the new <name>.local immediately
+#   5. drops a stamp file + disables itself -> runs exactly once
+#
+# Interaction with the agent's device_name (deliberately NOT a fight): the agent
+# resolves its operator-facing name as persisted DeviceName -> OS hostname ->
+# generic ("ResolvedDeviceName" in go-agent/internal/core/types.go). Setting a
+# unique OS hostname here just gives a good, collision-free DEFAULT; an operator
+# rename in the app still wins because it is stored as DeviceName.
+#
+# Interaction with Pi Imager: if the operator set their own hostname in Imager's
+# "Edit settings", that is a deliberate choice — we MUST keep it. This script
+# therefore only acts when the current hostname is still the stock default
+# (raspberrypi) or already one of ours; any other name is left untouched.
+set -euo pipefail
+
+STAMP="${GOPRINT_STAMP:-/var/lib/goprint/firstboot-hostname.done}"
+SELF_UNIT=goprint-firstboot-hostname.service
+PREFIX=goprint
+# Hostnames we are allowed to replace. The stock Pi OS default is "raspberrypi";
+# "raspberrypi-2" etc. appear when avahi's own collision fallback has kicked in.
+# Anything else is treated as an operator/Imager choice and left alone.
+STOCK_RE='^raspberrypi(-[0-9]+)?$'
+
+# Source / target paths come from these getters, which read the matching GOPRINT_*
+# env var or fall back to the real device path. Getters (not captured variables)
+# so the unit test can override any path PER CALL and exercise the SAME code that
+# runs on the Pi (no logic is duplicated in the test). On a real boot the env
+# vars are never set, so every getter returns the production path.
+cpuinfo_path()  { printf '%s' "${GOPRINT_CPUINFO:-/proc/cpuinfo}"; }
+machineid_path(){ printf '%s' "${GOPRINT_MACHINE_ID:-/etc/machine-id}"; }
+hostname_path() { printf '%s' "${GOPRINT_HOSTNAME_FILE:-/etc/hostname}"; }
+hosts_path()    { printf '%s' "${GOPRINT_HOSTS_FILE:-/etc/hosts}"; }
+
+log() { logger -t goprint-firstboot-hostname "$*" 2>/dev/null || true; echo "goprint-firstboot-hostname: $*"; }
+
+# derive_suffix — the short, stable, per-device hex tag. Pure (reads only the
+# cpuinfo / machine-id paths, prints the suffix); always prints non-empty.
+#   1. Pi serial from cpuinfo (16 hex digits) -> last 6, leading zeros trimmed
+#   2. no serial -> last 6 hex of the machine-id
+#   3. neither -> a timestamp tail (last resort; still boots with a name)
+derive_suffix() {
+  local serial trimmed suffix
+  serial="$(awk -F': ' '/^Serial/{print $2; exit}' "$(cpuinfo_path)" 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f')"
+  trimmed="$(printf '%s' "$serial" | sed 's/^0*//')"
+  [ -n "$trimmed" ] && serial="$trimmed"
+
+  # Last 6 hex via `tail -c 6` (NOT ${var: -6} — that yields "" on a
+  # shorter-than-6 string under bash 3.2's nounset, a portability foot-gun).
+  # tail -c 6 is uniform: last 6 chars, or the whole string if shorter.
+  if [ -n "$serial" ]; then
+    suffix="$(printf '%s' "$serial" | tail -c 6)"
+  elif [ -r "$(machineid_path)" ]; then
+    # The `< file` open is what errors on a missing path (tr's 2>/dev/null can't
+    # catch it), so gate on -r and wrap the group to stay silent regardless.
+    suffix="$({ tr -cd '0-9a-f' < "$(machineid_path)" | tail -c 6; } 2>/dev/null)"
+  fi
+  case "$suffix" in
+    "" ) suffix="$(date +%s | tail -c 6)" ;;
+  esac
+  printf '%s' "$suffix"
+}
+
+# may_replace_hostname CURRENT — true (0) only when CURRENT is the stock default
+# (or an avahi "-N" variant of it), i.e. NOT an operator/Imager choice. Empty
+# also counts as replaceable.
+may_replace_hostname() {
+  local cur="$1"
+  [ -z "$cur" ] && return 0
+  printf '%s' "$cur" | grep -Eq "$STOCK_RE"
+}
+
+# disable_self — make this a true once-only hook. Writes the stamp and removes
+# the WantedBy symlink so the unit never starts again, even if the stamp is
+# later deleted. Both steps tolerate failure (a missing symlink is fine).
+disable_self() {
+  install -d -m 0755 "$(dirname "$STAMP")" 2>/dev/null || true
+  : > "$STAMP" 2>/dev/null || true
+  systemctl disable "$SELF_UNIT" >/dev/null 2>&1 \
+    || rm -f "/etc/systemd/system/multi-user.target.wants/$SELF_UNIT" 2>/dev/null \
+    || true
+}
+
+# rewrite_hosts OLD NEW — keep the 127.0.1.1 line in $HOSTS_FILE pointing at the
+# new name. Replaces OLD on that line, or appends a 127.0.1.1 line if absent.
+# Writes via a temp file then copies back, so a failed write can't truncate
+# /etc/hosts and break local name resolution. Best-effort throughout.
+rewrite_hosts() {
+  local old="$1" new="$2" hosts tmp
+  hosts="$(hosts_path)"
+  [ -f "$hosts" ] || return 0
+  tmp="$(mktemp 2>/dev/null || echo "${hosts}.goprint.tmp")"
+  [ -n "$tmp" ] || return 0
+  if grep -q '^127\.0\.1\.1' "$hosts"; then
+    sed "s/^\(127\.0\.1\.1[[:space:]].*\)$old/\1$new/" "$hosts" > "$tmp" 2>/dev/null \
+      && cat "$tmp" > "$hosts" 2>/dev/null || true
+    # If OLD wasn't actually on the 127.0.1.1 line, make sure NEW is present.
+    grep -Eq "^127\.0\.1\.1[[:space:]].*(^|[[:space:]])$new([[:space:]]|\$)" "$hosts" \
+      || printf '127.0.1.1\t%s\n' "$new" >> "$hosts" 2>/dev/null || true
+  else
+    printf '127.0.1.1\t%s\n' "$new" >> "$hosts" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+# main — the actual first-boot flow. A function so the test can source this file
+# (to reach the pure helpers above) without triggering any of this.
+main() {
+  # Already ran on a prior boot? Nothing to do.
+  if [ -f "$STAMP" ]; then
+    log "stamp present ($STAMP); already provisioned, disabling"
+    disable_self
+    return 0
+  fi
+
+  # --- 1. derive the unique per-device suffix -------------------------------
+  local suffix new_host current
+  suffix="$(derive_suffix)"
+  new_host="${PREFIX}-${suffix}"
+  log "derived hostname $new_host (serial suffix '${suffix}')"
+
+  # --- 2. decide whether we may set it --------------------------------------
+  current="$(tr -d '[:space:]' < "$(hostname_path)" 2>/dev/null || true)"
+  [ -n "$current" ] || current="$(hostname 2>/dev/null || echo '')"
+
+  if [ "$current" = "$new_host" ]; then
+    log "hostname already $new_host; marking done"
+    disable_self
+    return 0
+  fi
+  if ! may_replace_hostname "$current"; then
+    # Operator/Imager picked a name — respect it, but don't run again.
+    log "current hostname '$current' is operator-set (not stock); leaving it, marking done"
+    disable_self
+    return 0
+  fi
+
+  # --- 3. apply the new hostname --------------------------------------------
+  # hostnamectl is the canonical path on Bookworm; fall back to the raw files +
+  # /proc if it is missing or fails, so this works even on a minimal image.
+  if command -v hostnamectl >/dev/null 2>&1 && hostnamectl set-hostname "$new_host" >/dev/null 2>&1; then
+    log "hostnamectl set-hostname $new_host"
+  else
+    log "hostnamectl unavailable/failed; writing files directly"
+    printf '%s\n' "$new_host" > "$(hostname_path)" 2>/dev/null || true
+    hostname "$new_host" 2>/dev/null || true
+  fi
+  # Always normalise the hostname file (hostnamectl does, the fallback may not).
+  printf '%s\n' "$new_host" > "$(hostname_path)" 2>/dev/null || true
+
+  # --- 4. keep /etc/hosts consistent (127.0.1.1 -> the new name) ------------
+  rewrite_hosts "$current" "$new_host"
+
+  # --- 5. make mDNS advertise the new name now ------------------------------
+  # avahi derives its .local host record from the kernel hostname. It picks up a
+  # hostnamectl change on its own, but a restart guarantees the new name is
+  # announced immediately rather than after avahi's next refresh. Best-effort:
+  # avahi may not be running yet this early in boot, and that's fine — it reads
+  # the correct hostname when it does start.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart avahi-daemon.service >/dev/null 2>&1 || true
+  fi
+
+  log "hostname set to $new_host; mDNS will advertise ${new_host}.local"
+
+  # --- 6. run exactly once --------------------------------------------------
+  disable_self
+  return 0
+}
+
+# Run main only when executed directly. When sourced (GOPRINT_FIRSTBOOT_SOURCED=1,
+# set by the unit test), define the helpers but do nothing else.
+if [ "${GOPRINT_FIRSTBOOT_SOURCED:-0}" != "1" ]; then
+  main
+fi

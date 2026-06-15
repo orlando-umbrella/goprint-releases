@@ -1,0 +1,29 @@
+# First-boot oneshot: give this Pi a unique hostname (goprint-<serial suffix>)
+# so multiple GoPrint appliances on one LAN don't collide on raspberrypi.local
+# (goprint#24). The helper sets the hostname, fixes /etc/hosts, nudges avahi,
+# then disables this unit so it runs exactly once.
+#
+# Safety: Type=oneshot + RemainAfterExit means a failure can't restart-loop, and
+# ConditionPathExists guards a second run even if the enable symlink lingers.
+# The helper itself tolerates every privileged step failing, so a bad run can
+# never block boot.
+[Unit]
+Description=GoPrint first-boot unique hostname
+Documentation=https://github.com/orlando-umbrella/goprint
+# Run before avahi first announces (so it advertises the unique name, not the
+# stock default) AND before the agent starts (so the agent's device_name default,
+# which falls back to the OS hostname, is the unique name from its very first
+# boot — see ResolvedDeviceName). Ordering only; no hard dependency, so a missing
+# target never blocks this unit. DefaultDependencies pulls in sysinit ordering.
+Before=avahi-daemon.service goprint-agent.service
+Wants=avahi-daemon.service
+# Skip entirely once we've stamped success — belt-and-braces with self-disable.
+ConditionPathExists=!/var/lib/goprint/firstboot-hostname.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/goprint-firstboot-hostname
+
+[Install]
+WantedBy=multi-user.target
