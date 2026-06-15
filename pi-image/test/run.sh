@@ -63,6 +63,13 @@ eq "edface" "$(GOPRINT_CPUINFO=$work/cpuinfo4 GOPRINT_MACHINE_ID=$work/mid4 deri
 s="$(GOPRINT_CPUINFO=$work/none GOPRINT_MACHINE_ID=$work/none derive_suffix)"
 if [ -n "$s" ]; then ok "no serial + no machine-id -> non-empty fallback"; else bad "fallback empty"; fi
 
+# Regression (BUG #1): an all-zero serial (VMs/emulators — never a real Pi)
+# carries no entropy and must NOT collapse every such device onto
+# goprint-000000; it falls through to the machine-id / timestamp fallback.
+printf 'Serial\t\t: 0000000000000000\n' > "$work/cpuinfoz"
+sz="$(GOPRINT_CPUINFO=$work/cpuinfoz GOPRINT_MACHINE_ID=$work/none derive_suffix)"
+if [ -n "$sz" ] && [ "$sz" != "000000" ]; then ok "all-zero serial -> not goprint-000000 (BUG #1)"; else bad "all-zero serial -> not 000000 (BUG #1)" "got [$sz]"; fi
+
 echo "== 3. may_replace_hostname (don't fight an operator/Imager name) =="
 if may_replace_hostname "raspberrypi";   then ok "stock 'raspberrypi' replaceable"; else bad "stock not replaceable"; fi
 if may_replace_hostname "raspberrypi-2"; then ok "avahi variant 'raspberrypi-2' replaceable"; else bad "avahi variant not replaceable"; fi

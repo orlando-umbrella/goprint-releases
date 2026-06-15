@@ -57,10 +57,19 @@ log() { logger -t goprint-firstboot-hostname "$*" 2>/dev/null || true; echo "gop
 #   2. no serial -> last 6 hex of the machine-id
 #   3. neither -> a timestamp tail (last resort; still boots with a name)
 derive_suffix() {
-  local serial trimmed suffix
+  # suffix initialized so a no-serial AND no-machine-id device can't abort under
+  # `set -u` before the timestamp fallback (the old code left `suffix` unset on
+  # that path -> crashed at the `case`, set no name, wrote no stamp, and so
+  # re-ran and re-crashed every boot). BUG #2 fix.
+  local serial trimmed suffix=""
   serial="$(awk -F': ' '/^Serial/{print $2; exit}' "$(cpuinfo_path)" 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f')"
+  # Strip leading zeros, then ADOPT the trimmed value unconditionally: an
+  # all-zero serial (VMs/emulators — never a real Pi) trims to "" so serial=""
+  # and we fall through to machine-id, instead of colliding every such device on
+  # goprint-000000. BUG #1 fix (was: `[ -n "$trimmed" ] && serial="$trimmed"`,
+  # which kept the all-zero serial).
   trimmed="$(printf '%s' "$serial" | sed 's/^0*//')"
-  [ -n "$trimmed" ] && serial="$trimmed"
+  serial="$trimmed"
 
   # Last 6 hex via `tail -c 6` (NOT ${var: -6} — that yields "" on a
   # shorter-than-6 string under bash 3.2's nounset, a portability foot-gun).
