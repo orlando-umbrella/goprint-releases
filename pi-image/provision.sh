@@ -155,4 +155,25 @@ install -d /etc/systemd/system/multi-user.target.wants
 ln -sf /etc/systemd/system/goprint-agent.service \
   /etc/systemd/system/multi-user.target.wants/goprint-agent.service
 
+# 6. First-boot unique hostname (goprint#24). The image ships with the stock
+#    `raspberrypi` hostname, so multiple flashed Pis collide on
+#    raspberrypi.local. We can't derive a per-device name at build time (the Pi
+#    serial is per-device), so install a oneshot that runs on the first REAL
+#    boot: it sets the hostname to goprint-<serial suffix>, fixes /etc/hosts,
+#    makes avahi advertise the new <name>.local, then disables itself. The
+#    helper is idempotent and best-effort — it never blocks boot. It also
+#    respects an operator hostname set in Pi Imager (only replaces the stock
+#    default), and it does NOT fight the agent's device_name (which falls back
+#    to the OS hostname, so this just supplies a good collision-free default).
+#    These files live next to provision.sh in this repo (pi-image/).
+src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+install -d /usr/local/libexec
+install -o root -g root -m 0755 \
+  "$src_dir/goprint-firstboot-hostname" /usr/local/libexec/goprint-firstboot-hostname
+install -o root -g root -m 0644 \
+  "$src_dir/goprint-firstboot-hostname.service" \
+  /etc/systemd/system/goprint-firstboot-hostname.service
+ln -sf /etc/systemd/system/goprint-firstboot-hostname.service \
+  /etc/systemd/system/multi-user.target.wants/goprint-firstboot-hostname.service
+
 echo "==> GoPrint provisioning complete (agent v$VERSION, brand $BRAND)."

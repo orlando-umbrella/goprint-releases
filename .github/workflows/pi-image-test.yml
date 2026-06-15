@@ -1,0 +1,42 @@
+name: Pi image scripts
+
+# Fast, dependency-light verification for the Pi image provisioning scripts.
+# Runs on every change under pi-image/ — the heavyweight image BUILD stays in
+# pi-image.yml (manual dispatch, ~1 GB + ARM emulation); this is just the
+# bash-level gate so a broken provision.sh / first-boot helper is caught in
+# seconds, before anyone kicks off a build.
+
+on:
+  push:
+    paths:
+      - "pi-image/**"
+      - ".github/workflows/pi-image-test.yml"
+  pull_request:
+    paths:
+      - "pi-image/**"
+      - ".github/workflows/pi-image-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: bash -n + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run pi-image test suite
+        run: bash pi-image/test/run.sh
+
+      # ShellCheck is preinstalled on ubuntu-latest runners. Informational only
+      # (continue-on-error): the bash test suite above is the hard gate; this
+      # surfaces extra lint without blocking on style-level findings.
+      - name: ShellCheck (informational)
+        continue-on-error: true
+        run: |
+          shellcheck --version
+          shellcheck pi-image/provision.sh \
+                     pi-image/goprint-firstboot-hostname \
+                     pi-image/test/run.sh
